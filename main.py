@@ -166,7 +166,7 @@ def receive_file(start_seq_num):
                 if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
                     peer_seq_num = seq_num + 1  # Advance to expect the next packet
 
-                print(f"Received fragment {seq_num}, size: {len(body)} bytes")
+                print(f"Received fragment {seq_num}, size: {len(body)} bytes peer_seq_num: {peer_seq_num}")
 
                 # Send ACK for received packet
                 ack_packet = create_packet(local_seq_num, seq_num + 1, 0, 0, header_flags.ACK, b'')
@@ -182,9 +182,7 @@ def receive_file(start_seq_num):
             # Break only when STOP flag was received, and all sequence numbers in the range are received
             if received_stop and set(range(start_seq_num + 1, stop_seq_num + 1)) <= set(received_data.keys()):
                 break
-
         except socket.timeout:
-            print("Timeout reached, waiting for missing packets...")
             continue
 
     # Write the received data to the file in the correct order
@@ -217,8 +215,7 @@ def receive_messages():
 
             if flags == headerStructure.header_flags.SYN and not connection_established:
                 print(f"\nReceived SYN from {addr}. Sending SYN-ACK...")
-                if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
-                    peer_seq_num = seq_num + 1  # Advance to expect the next packet
+                peer_seq_num = seq_num + 1  # Advance to expect the next packet
                 local_seq_num += 1  # Increment our own seq_num for SYN-ACK response
                 packet = create_packet(local_seq_num, peer_seq_num, 0, 0, headerStructure.header_flags.SYN_ACK, b'')
                 sock.sendto(packet, addr)
@@ -226,8 +223,7 @@ def receive_messages():
 
             elif flags == headerStructure.header_flags.SYN_ACK and not connection_established:
                 print(f"\nReceived SYN-ACK from {addr}. Sending ACK to complete handshake...")
-                if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
-                    peer_seq_num = seq_num + 1  # Advance to expect the next packet  # Update to expect the next peer sequence
+                peer_seq_num = seq_num + 1  # Advance to expect the next packet  # Update to expect the next peer sequence
                 local_seq_num += 1  # Increment our own sequence for the final ACK
                 packet = create_packet(local_seq_num, peer_seq_num, 0, 0, headerStructure.header_flags.ACK, b'')
                 sock.sendto(packet, addr)
@@ -236,8 +232,7 @@ def receive_messages():
                 print("Connection established!")
 
             elif flags == headerStructure.header_flags.ACK and not connection_established:
-                if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
-                    peer_seq_num = seq_num + 1  # Advance to expect the next packet # Update to expect the next peer sequence
+                peer_seq_num = seq_num + 1  # Advance to expect the next packet # Update to expect the next peer sequence
                 print("Received ACK for handshake. Connection established!")
                 LAST_RECEIVED_MSG_TIME = time.time()
                 connection_established = True
@@ -246,7 +241,7 @@ def receive_messages():
                 if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
                     peer_seq_num = seq_num + 1  # Advance to expect the next packet
 
-                print(f"Received ACK for sequence {ack_num} peer_seq_num {peer_seq_num}")
+                print(f"Received ACK for sequence {ack_num}")
                 last_acknowledged_seq = ack_num
                 LAST_RECEIVED_MSG_TIME = time.time()
 
@@ -269,12 +264,12 @@ def receive_messages():
                     print("Received keepalive ack")
                     LAST_RECEIVED_MSG_TIME = time.time()
 
-                print(f"Received packet with seq_num {seq_num}, peer_seq_num {peer_seq_num} ack_num {ack_num}, last_ack_seq {last_acknowledged_seq} flags {flags}, length {length}")
 
                 # Check if the packet is in the correct sequence from peer
                 if seq_num <= peer_seq_num and seq_num != 0:
-                    if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
+                    if seq_num == peer_seq_num:  # Only update if seq_num is in sequence or higher
                         peer_seq_num = seq_num + 1  # Advance to expect the next packet
+                    print(f"Received packet with seq_num {seq_num}, peer_seq_num {peer_seq_num} ack_num {ack_num}, last_ack_seq {last_acknowledged_seq} flags {flags}, length {length}")
 
                     if length > 0:
                         message = body.decode()
