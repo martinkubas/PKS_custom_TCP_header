@@ -17,19 +17,18 @@ PEER_IP = "127.0.0.1"
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((LOCAL_IP, LOCAL_PORT))
 
+fragment_size = 1000
+unacknowledged_packets = {}
+acknowledgment_timeout = 2  # seconds to wait before retransmitting a packet
+
 is_terminated = False
 connection_established = False
-
 LAST_RECEIVED_MSG_TIME = time.time()
 KEEPALIVE_INTERVAL = 5
 KEEPALIVE_THRESHOLD = 15
+local_seq_num, peer_seq_num, last_acknowledged_seq = 0, 0, 0  # Tracks the last acknowledged sequence number
 
-# Track sequence and acknowledgment numbers
-local_seq_num = 0
-peer_seq_num = 0
-last_acknowledged_seq = 0  # Tracks the last acknowledged sequence number
 
-fragment_size = 1
 def calculate_crc(data):
     crc16_func = crcmod.predefined.mkCrcFun('crc-16')
     return crc16_func(data)
@@ -85,8 +84,20 @@ def send_messages(message, bad_msg=False):
     local_seq_num += 1  # Increment local sequence number for each new message sent
     data = message.encode()
     packet = create_packet(local_seq_num, peer_seq_num, 0, len(data), 0, data, bad_msg)
+    unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, 0, data)
     print(f"Sending message '{message}' with seq_num {local_seq_num} and ack_num {peer_seq_num}")
     sock.sendto(packet, (PEER_IP, PEER_PORT))
+
+def handle_unacknowledged_packets():
+    while not is_terminated:
+        current_time = time.time()
+        for seq_num, (timestamp, seq_num, ack_num, flags, data) in list(unacknowledged_packets.items()):
+            if current_time - timestamp > acknowledgment_timeout:
+                print(f"Retransmitting packet with seq_num {seq_num}")
+                packet = create_packet(seq_num, ack_num, 0,len(data), flags, data)
+                sock.sendto(packet, (PEER_IP, PEER_PORT))  # Resend packet
+                unacknowledged_packets[seq_num] = (current_time, seq_num, ack_num, flags, data)  # Update timestamp
+        time.sleep(2)
 
 def send_file():
     global local_seq_num
@@ -106,8 +117,9 @@ def send_file():
 
     # Send file start packet with metadata
     local_seq_num += 1
-    start_packet = create_packet(local_seq_num, peer_seq_num, 0,len(file_name.encode()), header_flags.START, file_name.encode())
+    start_packet = create_packet(local_seq_num, peer_seq_num, 0, len(file_name.encode()), header_flags.START, file_name.encode())
     sock.sendto(start_packet, (PEER_IP, PEER_PORT))
+    unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, header_flags.START, file_name.encode())
 
     # Send file in fragments
     with open(file_path, 'rb') as file:
@@ -116,55 +128,73 @@ def send_file():
             packet = create_packet(local_seq_num, peer_seq_num, 0, len(chunk), 0, chunk)
             sock.sendto(packet, (PEER_IP, PEER_PORT))
 
+            # Track each sent packet for acknowledgment handling
+            unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, 0, chunk)
             print(f"Sent fragment {local_seq_num}, size: {len(chunk)} bytes")
 
-
-    # Send end-of-file packet
+    # Send STOP fragment to indicate end of transmission
     local_seq_num += 1
-    end_packet = create_packet(local_seq_num, peer_seq_num, 0, 0, header_flags.STOP, b'')
-    sock.sendto(end_packet, (PEER_IP, PEER_PORT))
-    print("File transfer complete.")
-
+    stop_packet = create_packet(local_seq_num, peer_seq_num, 0, 0, header_flags.STOP, b'')
+    sock.sendto(stop_packet, (PEER_IP, PEER_PORT))
+    unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, header_flags.STOP, b'')
 
 def receive_file(start_seq_num):
-    global peer_seq_num
+    global peer_seq_num, LAST_RECEIVED_MSG_TIME
     received_data = {}
-    file_start_time = time.time()
     file_name = "received_file.png"
-    expected_seq_num = start_seq_num + 1
+    stop_seq_num = None  # To store the expected last sequence number
+    received_stop = False
 
     while True:
-        data, addr = sock.recvfrom(1024)
-        body = data[headerStructure.HEADER_SIZE:]
-        seq_num, ack_num, window, length, flags, checksum, offset = parse_header(data)
+        try:
+            data, addr = sock.recvfrom(1024)
+            body = data[headerStructure.HEADER_SIZE:]
+            seq_num, ack_num, window, length, flags, checksum, offset = parse_header(data)
 
-        # Calculate the checksum of the header and body
-        checksum_calc_header = create_header(seq_num, ack_num, window, length, flags, 0)
-        calculated_checksum = calculate_crc(checksum_calc_header + body)
+            # Verify checksum
+            checksum_calc_header = create_header(seq_num, ack_num, window, length, flags, 0)
+            calculated_checksum = calculate_crc(checksum_calc_header + body)
+            if calculated_checksum != checksum:
+                print(f"Checksum mismatch for packet {seq_num}. Ignoring packet.")
+                continue
 
-        # Verify checksum
-        if calculated_checksum != checksum:
-            print(f"Checksum mismatch for packet {seq_num}. Requesting retransmission.")
-            # Send NACK (negative acknowledgment) to request retransmission
+            # Check if the packet is in the correct range for receiving
+            if seq_num >= start_seq_num and (stop_seq_num is None or seq_num <= stop_seq_num):
+                # Store received data using the sequence number
+                received_data[seq_num] = body
 
+                if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
+                    peer_seq_num = seq_num + 1  # Advance to expect the next packet
+
+                print(f"Received fragment {seq_num}, size: {len(body)} bytes")
+
+                # Send ACK for received packet
+                ack_packet = create_packet(local_seq_num, seq_num + 1, 0, 0, header_flags.ACK, b'')
+                sock.sendto(ack_packet, addr)
+                print(f"Sent ACK for seq_num {seq_num + 1}")
+
+                # If STOP flag is detected, mark the last sequence number
+                if flags == header_flags.STOP:
+                    print("received stop")
+                    received_stop = True
+                    stop_seq_num = seq_num  # Expected last sequence number
+
+            # Break only when STOP flag was received, and all sequence numbers in the range are received
+            if received_stop and set(range(start_seq_num + 1, stop_seq_num + 1)) <= set(received_data.keys()):
+                break
+
+        except socket.timeout:
+            print("Timeout reached, waiting for missing packets...")
             continue
 
-        # Store the byte in the dictionary using the relative sequence number
-        received_data[seq_num - (start_seq_num + 1)] = body
-        expected_seq_num += 1  # Move to the next expected sequence number
-        peer_seq_num = seq_num + 1
-        print(f"Received byte fragment {seq_num}, size: {len(body)} bytes")
-
-        # Detect the last packet in the sequence (if length < fragment_size)
-        if length < fragment_size:
-            break
-
-    # Write received data to file in order
+    # Write the received data to the file in the correct order
     with open(file_name, 'wb') as file:
         for i in sorted(received_data.keys()):
             file.write(received_data[i])
 
-    print(f"File received successfully. Size: {os.path.getsize(file_name)} bytes, Duration: {time.time() - file_start_time} seconds")
+    print(f"File received successfully. Size: {os.path.getsize(file_name)} bytes")
+    return
+
 
 def receive_messages():
     global is_terminated, connection_established, LAST_RECEIVED_MSG_TIME, peer_seq_num, last_acknowledged_seq, local_seq_num
@@ -176,19 +206,19 @@ def receive_messages():
             body = data[headerStructure.HEADER_SIZE:]
             seq_num, ack_num, window, length, flags, checksum, offset = parse_header(data)
 
-            #print(f"Received packet with seq_num {seq_num}, ack_num {ack_num}, last_ack_seq {last_acknowledged_seq} flags {flags}, length {length}, data {body.decode()}")
 
             checksum_calc_header = create_header(seq_num, ack_num, window, length, flags, 0)
             calculated_checksum = calculate_crc(checksum_calc_header + body)
             if calculated_checksum != checksum:
-                peer_seq_num += 1
+
                 print(f"Checksum mismatch! Packet may be corrupted. rec checksum: {checksum}, calc checksum: {calculated_checksum}")
                 continue
 
 
             if flags == headerStructure.header_flags.SYN and not connection_established:
                 print(f"\nReceived SYN from {addr}. Sending SYN-ACK...")
-                peer_seq_num = seq_num + 1  # Expect next packet with peer's seq_num + 1
+                if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
+                    peer_seq_num = seq_num + 1  # Advance to expect the next packet
                 local_seq_num += 1  # Increment our own seq_num for SYN-ACK response
                 packet = create_packet(local_seq_num, peer_seq_num, 0, 0, headerStructure.header_flags.SYN_ACK, b'')
                 sock.sendto(packet, addr)
@@ -196,7 +226,8 @@ def receive_messages():
 
             elif flags == headerStructure.header_flags.SYN_ACK and not connection_established:
                 print(f"\nReceived SYN-ACK from {addr}. Sending ACK to complete handshake...")
-                peer_seq_num = seq_num + 1  # Update to expect the next peer sequence
+                if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
+                    peer_seq_num = seq_num + 1  # Advance to expect the next packet  # Update to expect the next peer sequence
                 local_seq_num += 1  # Increment our own sequence for the final ACK
                 packet = create_packet(local_seq_num, peer_seq_num, 0, 0, headerStructure.header_flags.ACK, b'')
                 sock.sendto(packet, addr)
@@ -205,15 +236,31 @@ def receive_messages():
                 print("Connection established!")
 
             elif flags == headerStructure.header_flags.ACK and not connection_established:
-                peer_seq_num = seq_num + 1  # Update to expect the next peer sequence
+                if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
+                    peer_seq_num = seq_num + 1  # Advance to expect the next packet # Update to expect the next peer sequence
                 print("Received ACK for handshake. Connection established!")
                 LAST_RECEIVED_MSG_TIME = time.time()
                 connection_established = True
 
+            elif flags == headerStructure.header_flags.ACK and connection_established:
+                if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
+                    peer_seq_num = seq_num + 1  # Advance to expect the next packet
+
+                print(f"Received ACK for sequence {ack_num} peer_seq_num {peer_seq_num}")
+                last_acknowledged_seq = ack_num
+                LAST_RECEIVED_MSG_TIME = time.time()
+
+                # Remove acknowledged packets from unacknowledged_packets
+                if ack_num - 1 in unacknowledged_packets:
+                    del unacknowledged_packets[ack_num - 1]
+
             elif connection_established:
                 if flags == header_flags.START:
+                    ack_packet = create_packet(local_seq_num, seq_num + 1, 0, 0, header_flags.ACK, b'')
+                    sock.sendto(ack_packet, addr)
                     receive_file(seq_num)
-                elif flags == header_flags.KEEPALIVE:
+
+                if flags == header_flags.KEEPALIVE:
                     print("Received keepalive, sending keepalive ack")
                     packet = create_packet(0, 0, 0, 0, header_flags.KEEPALIVE_ACK, b'')
                     sock.sendto(packet, addr)
@@ -223,14 +270,12 @@ def receive_messages():
                     LAST_RECEIVED_MSG_TIME = time.time()
 
                 print(f"Received packet with seq_num {seq_num}, peer_seq_num {peer_seq_num} ack_num {ack_num}, last_ack_seq {last_acknowledged_seq} flags {flags}, length {length}")
-                if ack_num > last_acknowledged_seq and flags == header_flags.ACK:
-                    print(f"Received ACK for sequence {ack_num}")
-                    last_acknowledged_seq = ack_num
-                    LAST_RECEIVED_MSG_TIME = time.time()
 
                 # Check if the packet is in the correct sequence from peer
-                if seq_num == peer_seq_num:
-                    peer_seq_num += 1  # Increment expected peer sequence
+                if seq_num <= peer_seq_num and seq_num != 0:
+                    if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
+                        peer_seq_num = seq_num + 1  # Advance to expect the next packet
+
                     if length > 0:
                         message = body.decode()
                         print(f"\nMessage from {addr}: {message}")
@@ -271,7 +316,8 @@ def main():
     receive_thread.start()
     keepalive_thread = threading.Thread(target=keepalive)
     keepalive_thread.start()
-
+    unacknowledged_thread = threading.Thread(target=handle_unacknowledged_packets)
+    unacknowledged_thread.start()
     print("------------------------\n"
           "Ak chcete: \n"
           "poslat subor(nefunkcne) -> stlacte \"f\"\n"
@@ -302,6 +348,7 @@ def main():
             send_messages(choice)
 
     keepalive_thread.join()
+    unacknowledged_thread.join()
 
 if __name__ == "__main__":
     main()
