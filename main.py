@@ -17,6 +17,8 @@ PEER_IP = "127.0.0.1"
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((LOCAL_IP, LOCAL_PORT))
 
+WINDOW_SIZE = 15
+WINDOW_BASE = 0
 fragment_size = 1000
 unacknowledged_packets = {}
 acknowledgment_timeout = 2  # seconds to wait before retransmitting a packet
@@ -27,7 +29,6 @@ LAST_RECEIVED_MSG_TIME = time.time()
 KEEPALIVE_INTERVAL = 5
 KEEPALIVE_THRESHOLD = 15
 local_seq_num, peer_seq_num, last_acknowledged_seq = 0, 0, 0  # Tracks the last acknowledged sequence number
-
 
 def calculate_crc(data):
     crc16_func = crcmod.predefined.mkCrcFun('crc-16')
@@ -41,12 +42,10 @@ def create_packet(seq_num, ack_num, window, length, flags, data, bad_msg=False):
     checksum = 0
     header = create_header(seq_num, ack_num, window, length, flags, checksum)
     packet = header + data
-
     checksum = calculate_crc(packet)
     if bad_msg:
         checksum += 1
     checksum_header = create_header(seq_num, ack_num, window, length, flags, checksum)
-
     return checksum_header + data
 
 def parse_header(packet):
@@ -56,7 +55,6 @@ def establish_connection():
     global local_seq_num, connection_established
     if not connection_established:
         print("Initiating connection with SYN")
-        # Send SYN with the current local sequence number
         local_seq_num += 1  # Increment for initial SYN
         packet = create_packet(local_seq_num, 0, 0, 0, header_flags.SYN, b'')
         sock.sendto(packet, (PEER_IP, PEER_PORT))
@@ -67,21 +65,18 @@ def end_connection():
     global is_terminated, connection_established, local_seq_num, peer_seq_num
     if not connection_established:
         print("No active connection to end")
-
     print("Ending connection with FIN")
     local_seq_num += 1
     packet = create_packet(local_seq_num, 0, 0, 0, header_flags.FIN, b'')
     sock.sendto(packet, (PEER_IP, PEER_PORT))
     connection_established = False
 
-
 def send_messages(message, bad_msg=False):
     global local_seq_num
     if not connection_established:
         print("Connection not yet established, cannot send message")
         return
-
-    local_seq_num += 1  # Increment local sequence number for each new message sent
+    local_seq_num += 1
     data = message.encode()
     packet = create_packet(local_seq_num, peer_seq_num, 0, len(data), 0, data, bad_msg)
     unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, 0, data)
@@ -94,10 +89,10 @@ def handle_unacknowledged_packets():
         for seq_num, (timestamp, seq_num, ack_num, flags, data) in list(unacknowledged_packets.items()):
             if current_time - timestamp > acknowledgment_timeout:
                 print(f"Retransmitting packet with seq_num {seq_num}")
-                packet = create_packet(seq_num, ack_num, 0,len(data), flags, data)
-                sock.sendto(packet, (PEER_IP, PEER_PORT))  # Resend packet
-                unacknowledged_packets[seq_num] = (current_time, seq_num, ack_num, flags, data)  # Update timestamp
-        time.sleep(2)
+                packet = create_packet(seq_num, ack_num, 0, len(data), flags, data)
+                sock.sendto(packet, (PEER_IP, PEER_PORT))
+                unacknowledged_packets[seq_num] = (current_time, seq_num, ack_num, flags, data)
+        time.sleep(0.5)
 
 def send_file():
     global local_seq_num
@@ -123,15 +118,19 @@ def send_file():
 
     # Send file in fragments
     with open(file_path, 'rb') as file:
-        while chunk := file.read(fragment_size):
+        data = file.read(fragment_size)
+        while data:
+            if (local_seq_num + 1) - WINDOW_BASE >= WINDOW_SIZE:
+                time.sleep(0.1)  # Wait for space in the window
+                continue
             local_seq_num += 1
-            packet = create_packet(local_seq_num, peer_seq_num, 0, len(chunk), 0, chunk)
+            packet = create_packet(local_seq_num, peer_seq_num, 0, len(data), 0, data)
             sock.sendto(packet, (PEER_IP, PEER_PORT))
 
             # Track each sent packet for acknowledgment handling
-            unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, 0, chunk)
-            print(f"Sent fragment {local_seq_num}, size: {len(chunk)} bytes")
-
+            unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, 0, data)
+            print(f"Sent fragment {local_seq_num}, size: {len(data)} bytes")
+            data = file.read(fragment_size)
     # Send STOP fragment to indicate end of transmission
     local_seq_num += 1
     stop_packet = create_packet(local_seq_num, peer_seq_num, 0, 0, header_flags.STOP, b'')
@@ -167,7 +166,8 @@ def receive_file(start_seq_num):
                     peer_seq_num = seq_num + 1  # Advance to expect the next packet
 
                 print(f"Received fragment {seq_num}, size: {len(body)} bytes peer_seq_num: {peer_seq_num}")
-
+                LAST_RECEIVED_MSG_TIME = time.time()
+                
                 # Send ACK for received packet
                 ack_packet = create_packet(local_seq_num, seq_num + 1, 0, 0, header_flags.ACK, b'')
                 sock.sendto(ack_packet, addr)
@@ -194,8 +194,9 @@ def receive_file(start_seq_num):
     return
 
 
+
 def receive_messages():
-    global is_terminated, connection_established, LAST_RECEIVED_MSG_TIME, peer_seq_num, last_acknowledged_seq, local_seq_num
+    global is_terminated, connection_established, LAST_RECEIVED_MSG_TIME, peer_seq_num, last_acknowledged_seq, local_seq_num,  WINDOW_BASE
 
     while not is_terminated:
         try:
@@ -249,11 +250,26 @@ def receive_messages():
                 if ack_num - 1 in unacknowledged_packets:
                     del unacknowledged_packets[ack_num - 1]
 
+                # Update WINDOW_BASE if the lowest unacknowledged packet is acknowledged
+                # Find the smallest unacknowledged sequence number
+                if unacknowledged_packets:
+                    min_unacknowledged = min(unacknowledged_packets.keys())
+                    if ack_num >= min_unacknowledged:
+                        # Update WINDOW_BASE to the next unacknowledged packet after the ack_num
+                        while min_unacknowledged <= ack_num and min_unacknowledged in unacknowledged_packets:
+                            del unacknowledged_packets[min_unacknowledged]
+                            min_unacknowledged = min(unacknowledged_packets.keys(), default=WINDOW_BASE)
+
+                        WINDOW_BASE = min_unacknowledged
+                        print(f"Updated WINDOW_BASE to {WINDOW_BASE}")
+                else:
+                    WINDOW_BASE = ack_num
             elif connection_established:
                 if flags == header_flags.START:
                     ack_packet = create_packet(local_seq_num, seq_num + 1, 0, 0, header_flags.ACK, b'')
                     sock.sendto(ack_packet, addr)
                     receive_file(seq_num)
+                    continue
 
                 if flags == header_flags.KEEPALIVE:
                     print("Received keepalive, sending keepalive ack")
