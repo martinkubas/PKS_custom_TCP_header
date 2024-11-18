@@ -19,7 +19,7 @@ sock.bind((LOCAL_IP, LOCAL_PORT))
 
 WINDOW_SIZE = 15
 WINDOW_BASE = 0
-fragment_size = 1000
+fragment_size = 1
 unacknowledged_packets = {}
 acknowledgment_timeout = 2  # seconds to wait before retransmitting a packet
 
@@ -76,12 +76,35 @@ def send_messages(message, bad_msg=False):
     if not connection_established:
         print("Connection not yet established, cannot send message")
         return
-    local_seq_num += 1
-    data = message.encode()
-    packet = create_packet(local_seq_num, peer_seq_num, 0, len(data), 0, data, bad_msg)
-    unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, 0, data)
-    print(f"Sending message '{message}' with seq_num {local_seq_num} and ack_num {peer_seq_num}")
-    sock.sendto(packet, (PEER_IP, PEER_PORT))
+    if len(message) > fragment_size:
+
+        fragments = [message[i:i + fragment_size] for i in range(0, len(message), fragment_size)]
+
+        # Send each fragment with FRAG flag, except the last one
+        i = 0
+        while i < len(fragments):
+            if (local_seq_num + 1) - WINDOW_BASE >= WINDOW_SIZE:
+                time.sleep(0.1)  # Wait for space in the window
+                continue
+
+            fragment = fragments[i].encode()
+            local_seq_num += 1
+            flag = header_flags.FRAG if i < len(fragments) - 1 else header_flags.FRAGSTOP
+            packet = create_packet(local_seq_num, peer_seq_num, 0, len(fragment), flag, fragment, bad_msg)
+            sock.sendto(packet, (PEER_IP, PEER_PORT))
+
+            unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, flag, fragment)
+            print(f"Sent fragment {local_seq_num}, size: {len(fragment)} bytes")
+            i += 1
+        time.sleep(1)
+        print(f"{unacknowledged_packets}")
+    else:
+        local_seq_num += 1
+        data = message.encode()
+        packet = create_packet(local_seq_num, peer_seq_num, 0, len(data), 0, data, bad_msg)
+        unacknowledged_packets[local_seq_num] = (time.time(), local_seq_num, peer_seq_num, 0, data)
+        print(f"Sending message '{message}' with seq_num {local_seq_num} and ack_num {peer_seq_num}")
+        sock.sendto(packet, (PEER_IP, PEER_PORT))
 
 def handle_unacknowledged_packets():
     while not is_terminated:
@@ -167,7 +190,7 @@ def receive_file(start_seq_num):
 
                 print(f"Received fragment {seq_num}, size: {len(body)} bytes peer_seq_num: {peer_seq_num}")
                 LAST_RECEIVED_MSG_TIME = time.time()
-                
+
                 # Send ACK for received packet
                 ack_packet = create_packet(local_seq_num, seq_num + 1, 0, 0, header_flags.ACK, b'')
                 sock.sendto(ack_packet, addr)
@@ -197,7 +220,10 @@ def receive_file(start_seq_num):
 
 def receive_messages():
     global is_terminated, connection_established, LAST_RECEIVED_MSG_TIME, peer_seq_num, last_acknowledged_seq, local_seq_num,  WINDOW_BASE
-
+    received_message = {}
+    start_seq_num = None
+    stop_seq_num = None  # To store the expected last sequence number
+    received_stop = False
     while not is_terminated:
         try:
             sock.settimeout(1)
@@ -281,8 +307,49 @@ def receive_messages():
                     LAST_RECEIVED_MSG_TIME = time.time()
 
 
-                # Check if the packet is in the correct sequence from peer
-                if seq_num <= peer_seq_num and seq_num != 0:
+                elif flags == header_flags.FRAG:
+                    if stop_seq_num is None or seq_num <= stop_seq_num:
+                        received_message[seq_num] = body
+
+                    if start_seq_num is None or seq_num < start_seq_num :
+                        start_seq_num = seq_num
+
+                    if seq_num >= peer_seq_num:  # Only update if seq_num is in sequence or higher
+                        peer_seq_num = seq_num + 1  # Advance to expect the
+                    print(f"Received fragment {seq_num}, size: {len(body)} bytes peer_seq_num: {peer_seq_num}")
+                    LAST_RECEIVED_MSG_TIME = time.time()
+
+                    ack_packet = create_packet(local_seq_num, seq_num + 1, 0, 0, header_flags.ACK, b'')
+                    sock.sendto(ack_packet, addr)
+                    print(f"Sent ACK for seq_num {seq_num + 1}")
+                    if received_stop and set(range(start_seq_num + 1, stop_seq_num + 1)) <= set(received_message.keys()):
+
+                            # Process full message
+                            print("Full message received:",''.join(received_message[seq].decode() for seq in sorted(received_message.keys())))
+
+                            received_message = {}
+                            start_seq_num, stop_seq_num, received_stop = None, None, False
+
+
+
+                elif flags == header_flags.FRAGSTOP:
+                    print("received stop")
+                    received_stop = True
+                    stop_seq_num = seq_num
+
+                    received_message[seq_num] = body
+
+                    ack_packet = create_packet(local_seq_num, seq_num + 1, 0, 0, header_flags.ACK, b'')
+                    sock.sendto(ack_packet, addr)
+                    # Process full message
+                    if received_stop and set(range(start_seq_num + 1, stop_seq_num + 1)) <= set(received_message.keys()):
+                        print("Full fragmented message received:",''.join(received_message[seq].decode() for seq in sorted(received_message.keys())))
+
+                        received_message = {}
+                        start_seq_num, stop_seq_num, received_stop = None, None, False
+
+                    # Check if the packet is in the correct sequence from peer
+                elif seq_num <= peer_seq_num and seq_num != 0:
                     if seq_num == peer_seq_num:  # Only update if seq_num is in sequence or higher
                         peer_seq_num = seq_num + 1  # Advance to expect the next packet
                     print(f"Received packet with seq_num {seq_num}, peer_seq_num {peer_seq_num} ack_num {ack_num}, last_ack_seq {last_acknowledged_seq} flags {flags}, length {length}")
