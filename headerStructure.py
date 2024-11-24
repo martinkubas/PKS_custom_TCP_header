@@ -1,10 +1,10 @@
 HEADER_SIZE = 16 #velkost v bajtoch
 # I = 32-bit seq number, ack number
-# H = 16-bit window, length
+# H = 16-bit length
 # B = 8-bit flags
 # H = 16-bit checksum
 # 3B = 24-bit offset - nech to je 16B dokopy
-HEADER_FORMAT = '!IIHHBHB'
+HEADER_FORMAT = '!IIHBH3B'
 
 
 class Flags():
