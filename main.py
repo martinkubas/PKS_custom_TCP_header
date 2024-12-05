@@ -11,10 +11,10 @@ from connection import establish_connection, end_connection
 LOCAL_PORT = int(input("Zadaj svoj port: "))
 PEER_PORT = int(input("Zadaj kamaratov port: "))
 
-LOCAL_IP = input("Zadaj svoju IP: ")
-PEER_IP = input("Zadaj kamaratovu IP: ")
-#LOCAL_IP = "127.0.0.1"
-#PEER_IP = "127.0.0.1"
+#LOCAL_IP = input("Zadaj svoju IP: ")
+#PEER_IP = input("Zadaj kamaratovu IP: ")
+LOCAL_IP = "127.0.0.1"
+PEER_IP = "127.0.0.1"
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((LOCAL_IP, LOCAL_PORT))
@@ -44,6 +44,8 @@ def send_messages(message, bad_msg=False):
     if not connection_established:
         print("Este neprebehlo spojenie, sprava sa neda odoslat")
         return
+    
+    message = message.upper()
     if len(message) > fragment_size: #ak je sprava dlhsia ako max fragment size
         fragments = [message[i:i + fragment_size] for i in range(0, len(message), fragment_size)]
 
